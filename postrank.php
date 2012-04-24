@@ -4,7 +4,7 @@ Plugin Name: PostRank
 Plugin URI: http://jeeker.net/projects/postrank/
 Description: The ranking of your posts. Visit <a href="http://jeeker.net/projects/postrank/">Jeeker</a> for usage information and project news.
 Author: JinnLynn
-Version: 0.1.1
+Version: 0.1.3
 Author URI: http://jeeker.net/
 */
 
@@ -13,10 +13,10 @@ Author URI: http://jeeker.net/
  *
  * @since 0.1
  */
-define('POSTRANK_VERSION', '0.1.1');
+define('POSTRANK_VERSION', '0.1.3');
 
 /**
- * JPostRank
+ * PostRank
  * 
  * 日志排名处理类
  *
@@ -29,9 +29,9 @@ class PostRank {
      * @var array
      */
     private $DefaultOptions = array( 'single_value'         => 1,
-                                     'comment_value'        => 3,
-                                     'pingback_value'       => 5,
-                                     'trackback_value'      => 8,
+                                     'comment_value'        => 10,
+                                     'pingback_value'       => 15,
+                                     'trackback_value'      => 25,
                                      'exclude_bots'         => true,
                                      'fresh_interval'       => 1800,
                                      'show_tips'            => true,
@@ -190,7 +190,7 @@ class PostRank {
      * @since 0.1
      */
     function RecordViews() {
-        if (!is_single() && !is_page()) 
+        if ((!is_single() && !is_page()) || is_preview()) 
             return;
         if ($this->Options['exclude_bots']) {
             $useragent = $_SERVER['HTTP_USER_AGENT'];
@@ -214,26 +214,61 @@ class PostRank {
         $post_id = intval($post_id);
         if ($post_id <= 0)
             return;
-        $views_value = $this->GetViews($post_id) * $this->Options['single_value'];
+        $rank = $this->CalcRank($post_id);
+        $this->UpdateRank($post_id, $rank, true);
+    }
+
+    function CalcRank($post_id)
+    {
+        global $wpdb;
+        $comment_score = 0;
         $sql = "
-                SELECT comment_type
+                SELECT post_date_gmt
+                FROM $wpdb->posts
+                WHERE ID = $post_id
+            ";
+        $results = $wpdb->get_results($sql);
+        if (empty($results))
+                return 0;
+        $post_gmt_time = strtotime($results[0]->post_date_gmt);
+        $cur_gmt_time = gmmktime();
+        if ($cur_gmt_time <= $post_gmt_time)
+            return 0;
+
+        $sql = "
+                SELECT comment_type, comment_date_gmt
                 FROM $wpdb->comments
                 WHERE comment_post_ID=$post_id AND comment_approved='1'
                ";
         $results = $wpdb->get_results($sql);
-        if (empty($results))
-            return $this->UpdateRank($post_id, $views_value, true);
-        $rank = 0;
-        foreach ($results AS $comment) {
-            if ($comment->comment_type == '')
-                $rank += $this->Options['comment_value'];
-            else if ($comment->comment_type == 'pinkback')
-                $rank += $this->Options['pingback_value'];
-            else if ($comment->comment_type == 'trackback')
-                $rank += $this->Options['trackback_value'];
+        if (!empty($results))
+        {
+            foreach ($results AS $comment) {
+                if ($comment->comment_type == '')
+                    $comment_score += $this->Options['comment_value'] / $this->CalcCommentWeighting($comment->comment_date_gmt);
+                else if ($comment->comment_type == 'pinkback')
+                    $comment_score += $this->Options['pingback_value'] / $this->CalcCommentWeighting($comment->comment_date_gmt);
+                else if ($comment->comment_type == 'trackback')
+                    $comment_score += $this->Options['trackback_value'] / $this->CalcCommentWeighting($comment->comment_date_gmt);
+            }
         }
-        $rank += $views_value;
-        $this->UpdateRank($post_id, $rank, true);
+
+        $view_score = log10($this->GetViews($post_id)) * 4;
+        $score = $comment_score + $view_score;
+
+        $post_date_weighting = log(($cur_gmt_time - $post_gmt_time) / 31536000);
+        if ($post_date_weighting < 1 )
+            $post_date_weighting = 1;
+        $score = floatval($score) / $post_date_weighting;
+        return $score;
+    }
+
+    function CalcCommentWeighting($comment_date_gmt)
+    {
+        $year_interval = (gmmktime() - strtotime($comment_date_gmt)) / 31536000;
+        if ($year_interval < 1)
+            return 1;
+        return $year_interval;
     }
     
     /**
@@ -266,8 +301,7 @@ class PostRank {
      */
     function UpdateViews($post_id = 0) {
         $post_views = $this->GetViews($post_id) + 1;
-        if (!update_post_meta($post_id, '_post_views', $post_views))
-           add_post_meta($post_id, '_post_views', 1);
+        update_post_meta($post_id, '_post_views', $post_views);
         $this->UpdateRank($post_id, $this->Options['single_value']);
     }
     
@@ -279,7 +313,7 @@ class PostRank {
      * @return int
      */
     function GetRank($post_id = 0) {
-        return intval(get_post_meta($post_id, '_post_rank', true));
+        return floatval(get_post_meta($post_id, '_post_rank', true));
     }
     
     /**
@@ -291,9 +325,39 @@ class PostRank {
      */
     function UpdateRank($post_id = 0, $add = 0, $reset = false) {
         ($reset) ? ($rank = $add) : ($rank = $this->GetRank($post_id) + $add);
-        if (!update_post_meta($post_id, '_post_rank', $rank))
-            add_post_meta($post_id, '_post_rank', $rank);        
+        update_post_meta($post_id, '_post_rank', $rank);        
     }
+    
+    /**
+     *  保证日志积分的metadata值是唯一的（防止在3.0后出现重复记录）
+     *
+     * @param int $post_id
+     * @since 0.1.2
+     */
+     function MakeRankMetadataUnique() {
+     	global $wpdb;
+     	$sql = "
+     				SELECT post_id, COUNT(meta_id) AS nums 
+     				FROM $wpdb->postmeta 
+     				WHERE meta_key='_post_rank'
+     				GROUP BY post_id
+     			  ";
+     	$res = $wpdb->get_results($sql);
+     	//var_dump($res);
+     	foreach ($res as $item) {
+     		$del_nums = intval($item->nums) - 1;
+     		if ($del_nums <= 0)
+     			continue;
+     		$sql = "
+     					DELETE
+     					FROM $wpdb->postmeta
+     					WHERE meta_key='_post_rank' AND post_id=$item->post_id
+     					LIMIT $del_nums
+     					";
+     		$wpdb->query($sql);
+     	}
+
+     }
     
    /**
      * 重新统计
@@ -304,53 +368,18 @@ class PostRank {
         $posts = array();
         global $wpdb;
         $sql = "
-                SELECT comment_post_ID AS post_id, COUNT(comment_ID) AS comment_nums
-                FROM $wpdb->comments
-                WHERE comment_approved=1 AND comment_type=''
-                GROUP BY comment_post_ID
-               ";
+                SELECT ID
+                FROM $wpdb->posts
+                WHERE post_status='publish'
+                ";
         $results = $wpdb->get_results($sql);
+        if (empty($results))
+            return;
         foreach ($results as $post) {
-            $posts[intval($post->post_id)]['comment'] = intval($post->comment_nums);
+            $rank = $this->CalcRank($post->ID);
+            $this->UpdateRank($post->ID, $rank, true);
         }
-        $sql = "
-                SELECT comment_post_ID AS post_id, COUNT(comment_ID) AS pingback_nums
-                FROM $wpdb->comments
-                WHERE comment_approved=1 AND comment_type='pingback'
-                GROUP BY comment_post_ID
-               ";
-        $results = $wpdb->get_results($sql);
-        foreach ($results as $post) {
-            $posts[intval($post->post_id)]['pingback'] = intval($post->pingback_nums);
-        }
-        $sql = "
-                SELECT comment_post_ID AS post_id, COUNT(comment_ID) AS trackback_nums
-                FROM $wpdb->comments
-                WHERE comment_approved=1 AND comment_type='trackback'
-                GROUP BY comment_post_ID
-               ";
-        $results = $wpdb->get_results($sql);
-        foreach ($results as $post) {
-            $posts[intval($post->post_id)]['trackback'] = intval($post->trackback_nums);
-        }
-        $sql = "
-                SELECT post_id, meta_value AS post_views
-                FROM $wpdb->postmeta
-                WHERE meta_key='_post_views'
-               ";
-        $results = $wpdb->get_results($sql);
-        foreach ($results as $post) {
-            $posts[intval($post->post_id)]['views'] = intval($post->post_views);              
-        }
-        foreach ($posts as $post_id => $ranks) {
-            if ($post_id <= 0)
-               break;
-            $score = $ranks['comment'] * $this->Options['comment_value']
-                     + $ranks['pingback'] * $this->Options['pingback_value']
-                     + $ranks['trackback'] * $this->Options['trackback_value']
-                     + $ranks['views'] * $this->Options['single_value'];
-            $this->UpdateRank($post_id, $score, true);
-        }
+        $this->MakeRankMetadataUnique();
         $this->GetTopRank();
     }
     
@@ -433,6 +462,7 @@ class PostRank {
                 ORDER BY rank DESC, $wpdb->posts.post_date DESC
                 LIMIT $limit
                 ";
+        //echo $sql;
         $results = $wpdb->get_results($sql);
         foreach ($results as $post) {
             $output .= "\t" . $before . '<a href="' . get_permalink($post->ID) . '" title="' . htmlspecialchars($post->post_title, ENT_QUOTES) . '">' . htmlspecialchars($post->post_title, ENT_QUOTES) . '</a>' . $after . "\n";
@@ -714,8 +744,8 @@ class PostRank {
         $post_nums = $wpdb->get_var("SELECT FOUND_ROWS()");
         $max_page = ceil($post_nums / $per_page);
         echo '
-        <h2>PostRank Reports</h2>
-        <form id="postrank-report" action="" method="get">   
+        <h2 id="postrank-report">PostRank Reports</h2>
+        <form id="postrank-report-form" action="" method="get">   
         <input type="hidden" name="postrank_report_action" value="1" />
         <input type="hidden" name="page" value="postrank_admin_options_page" />
         <div class="tablenav">
@@ -889,7 +919,6 @@ class PostRank {
             $this->ResetOptions();
         else if (isset($_POST['re_stat']))
             $this->ReStat();
-
         echo '
 <script type="text/javascript">
     jQuery(function($) {
@@ -994,6 +1023,7 @@ register_activation_hook(__FILE__, 'JPR_Activate');
 function JPR_Init() {
     global $PostRank;
     $PostRank = new PostRank;
+    $PostRank->MakeRankMetadataUnique();
 }
 add_action('plugins_loaded', 'JPR_Init');
 /**
